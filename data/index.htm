@@ -1,0 +1,145 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Data Stream</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="uPlot.min.css">
+    <script src="uPlot.iife.min.js"></script>
+
+    <script>
+      window.onload = () => { updateOrMakeChart(); }
+
+      function updateOrMakeChart(existingPlot) {
+        let wait = document.getElementById("wait");
+        wait.textContent = "Fetching data....";
+        fetch("/data").then(r => r.json()).then(packed => {
+          wait.textContent = "Rendering...";
+          let data = prepData(packed);
+          setTimeout(() => {
+            if (!existingPlot) {
+              makeChart(data);
+            } else {
+              existingPlot.setData(data);
+            }
+            wait.textContent = "Done!";
+          }, 0);
+        });
+      }
+      
+      function prepData(packed) {
+
+        let data = [
+          Array(packed.length),
+          Array(packed.length),
+          Array(packed.length),
+        ];
+
+        for (let i = 0; i < packed.length; i++) {
+          data[0][i] = packed[i][0];
+          data[1][i] = packed[i][1];
+          data[2][i] = packed[i][2];
+        }
+
+        return data;
+      }
+
+      function getSize() {
+        return {
+          width: window.innerWidth - 100,
+          height: window.innerHeight - 200,
+        }
+      }
+      
+      function makeChart(data) {
+
+        const opts = {
+          title: "Current / Voltage",
+          ...getSize(),
+          cursor: {
+            drag: {
+              setScale: false,
+            }
+          },
+          select: {
+            show: false,
+          },
+          series: [
+            {
+              value: "{YYYY}-{MM}-{DD} {HH}:{mm}:{ss}"
+            },
+            {
+              label: "Current",
+              value: (u, v) => v == null ? "-" : v.toFixed(0) + " mA",
+              stroke: "red",
+              scale: "mA",
+            },
+            {
+              label: "Voltage",
+              value: (u, v) => v == null ? "-" : (v / 1000).toFixed(2) + " V",
+              stroke: "blue",
+              scale: "mV",
+            }
+          ],
+          axes: [
+            {
+              values: [
+                // tick incr  default       year                        month day                    hour  min                sec   mode 
+                [3600*24*365,"{YYYY}",      null,                       null, null,                  null, null,              null, 1],
+                [3600*24*28, "{MMM}",       "\n{YYYY}",                 null, null,                  null, null,              null, 1],
+                [3600*24,    "{D}/{M}",     "\n{YYYY}",                 null, null,                  null, null,              null, 1],
+                [3600,       "{HH}",        "\n{D}/{M}/{YY}",           null, "\n{D}/{M}",           null, null,              null, 1],
+                [60,         "{HH}:{mm}",   "\n{D}/{M}/{YY}",           null, "\n{D}/{M}",           null, null,              null, 1],
+                [1,          ":{ss}",       "\n{D}/{M}/{YY} {HH}:{mm}", null, "\n{D}/{M} {HH}:{mm}", null, "\n{HH}:{mm}",     null, 1],
+                [0.001,      ":{ss}.{fff}", "\n{D}/{M}/{YY} {HH}:{mm}", null, "\n{D}/{M} {HH}:{mm}", null, "\n{HH}:{mm}",     null, 1],
+                ],
+            },
+            {
+              scale: "mA",
+              values: (self, ticks) => ticks.map(rawValue => rawValue.toFixed(0) + " mA"),
+            },
+            {
+              scale: "mV",
+              values: (self, ticks) => ticks.map(rawValue => (rawValue / 1000).toFixed(2) + " V"),
+              side: 1,
+              grid: {show: false},
+            },
+          ],
+          scales: {
+            "mA": {
+              range: {
+                min: { pad: 0, soft: 0, mode: 1 },
+                max: { pad: 0, soft: 0, mode: 1 },
+              }
+            },
+            "mV": {
+              range: {
+                min: { pad: 0, soft: 0, mode: 1 },
+                max: { pad: 0, soft: 0, mode: 1 },
+              }
+            },
+          },
+          hooks: {
+            init: [
+              u => {
+                u.root.querySelector(".u-over").ondblclick = e => {
+                  updateOrMakeChart(u);
+                }
+              }
+            ],
+          },
+        };
+
+        let u = new uPlot(opts, data, document.getElementById("chart"));
+        
+        window.addEventListener("resize", e => { u.setSize(getSize()); });
+
+      }
+    </script>
+  </head>
+
+  <body>
+    <div id="chart"></div>
+    <h2 id="wait">Loading lib....</h2>
+  </body>
+</html>
