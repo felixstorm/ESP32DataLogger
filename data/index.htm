@@ -8,22 +8,47 @@
     <script src="uPlot.iife.min.js"></script>
 
     <script>
+      var u;
+
       window.onload = () => { updateOrMakeChart(); }
 
-      function updateOrMakeChart(existingPlot) {
+      function updateOrMakeChart(timestampMin, timestampMax) {
         let wait = document.getElementById("wait");
         wait.textContent = "Fetching data....";
-        fetch("/data").then(r => r.json()).then(packed => {
+        const params = new URLSearchParams();
+        if (timestampMin) { params.append("from", timestampMin); }
+        if (timestampMax) { params.append("until", timestampMax); }
+        fetch("/data?" + params).then(r => r.json()).then(packed => {
           wait.textContent = "Rendering...";
           let data = prepData(packed);
-          setTimeout(() => {
-            if (!existingPlot) {
-              makeChart(data);
-            } else {
-              existingPlot.setData(data);
+          //console.log(`data: first = ${data[0][0]}, last = ${data[0][data[0].length - 1]})`);
+          if (!u) {
+            u = makeChart(data);
+            new EventSource("/dataevents").onmessage = (event) => {
+              // console.log(`received message ${event.data}`);
+              const jsonRecord = JSON.parse(event.data);
+              const messageTimestamp = jsonRecord[0];
+              const messageTimestampIsValid = messageTimestamp >= 1609455600 // 2021-01-01
+              const uIsEmpty = u.data[0].length == 0;
+              const uDataLatestTimestamp = u.data[0][u.data[0].length - 1];
+              const xScaleMax = u.scales.x.max;
+              const addMessage = messageTimestampIsValid && (uIsEmpty || (Math.abs(messageTimestamp-xScaleMax) < 70 && messageTimestamp > uDataLatestTimestamp));
+              // console.log(`messageTimestamp: ${messageTimestamp}, messageTimestampIsValid: ${messageTimestampIsValid}, uIsEmpty: ${uIsEmpty}, uDataLatestTimestamp: ${uDataLatestTimestamp}, xScaleMax: ${xScaleMax}, addMessage: ${addMessage}`);
+              if (addMessage) {
+                u.data[0].push(jsonRecord[0]);
+                u.data[1].push(jsonRecord[1]);
+                u.data[2].push(jsonRecord[2]);
+                u.setData(u.data, false);
+                u.setScale('x', {
+                  min: uIsEmpty ? messageTimestamp - 1 : u.scales.x.min,
+                  max: u.data[0][u.data[0].length - 1],
+                });
+              }
             }
-            wait.textContent = "Done!";
-          }, 0);
+          } else {
+            u.setData(data);
+          }
+          wait.textContent = "Done!";
         });
       }
       
@@ -51,11 +76,118 @@
         }
       }
       
+      function debounce(fn, time) {
+      	let pending = null;
+      	function run() {
+      		pending = null;
+      		fn();
+      	}
+      	return function() {
+      		clearTimeout(pending);
+      		pending = setTimeout(run, time);
+      	}
+      }
+      let fetchDataDebounced = debounce(() => {
+        if (u.scales.x.min < u.data[0][0] || u.scales.x.max > u.data[0][u.data[0].length - 1] ) {
+          updateOrMakeChart(u.scales.x.min, u.scales.x.max);
+        }
+      }, 500)
+
+      
+      function wheelZoomPlugin(opts) {
+        let factor = opts.factor || 0.75;
+
+        let xMin, xMax, yMin, yMax, xRange, yRange;
+
+        function clamp(nRange, nMin, nMax, fRange, fMin, fMax) {
+          if (nRange > fRange) {
+            nMin = fMin;
+            nMax = fMax;
+          }
+          else if (nMin < fMin) {
+            nMin = fMin;
+            nMax = fMin + nRange;
+          }
+          else if (nMax > fMax) {
+            nMax = fMax;
+            nMin = fMax - nRange;
+          }
+
+          return [nMin, nMax];
+        }
+
+        return {
+          hooks: {
+            ready: u => {
+              let plot = u.root.querySelector(".u-over");
+              let rect = plot.getBoundingClientRect();
+
+              // wheel drag pan
+              plot.addEventListener("mousedown", e => {
+                if (e.button == 1) {
+                  e.preventDefault();
+
+                  let left0 = e.clientX;
+                  let scXMin0 = u.scales.x.min;
+                  let scXMax0 = u.scales.x.max;
+                  let xUnitsPerPx = u.posToVal(1, 'x') - u.posToVal(0, 'x');
+
+                  function onmove(e) {
+                    e.preventDefault();
+
+                    let left1 = e.clientX;
+                    let dx = xUnitsPerPx * (left1 - left0);
+                    u.setScale('x', {
+                      min: scXMin0 - dx,
+                      max: scXMax0 - dx,
+                    });
+                  }
+
+                  function onup(e) {
+                    document.removeEventListener("mousemove", onmove);
+                    document.removeEventListener("mouseup", onup);
+                    fetchDataDebounced();
+                  }
+                  
+                  document.addEventListener("mousemove", onmove);
+                  document.addEventListener("mouseup", onup);
+                }
+              });
+
+              // wheel scroll zoom
+              plot.addEventListener("wheel", e => {
+                e.preventDefault();
+
+                let left = u.cursor.left;
+                let leftPct = left/rect.width;
+                let xVal = u.posToVal(left, "x");
+                let oxRange = u.scales.x.max - u.scales.x.min;
+
+                let nxRange = e.deltaY < 0 ? oxRange * factor : oxRange / factor;
+                let nxMin = xVal - leftPct * nxRange;
+                let nxMax = nxMin + nxRange;
+
+                u.batch(() => {
+                  u.setScale("x", {
+                    min: nxMin,
+                    max: nxMax,
+                  });
+                });
+                fetchDataDebounced();
+              });
+            }
+          }
+        };
+      }
+
       function makeChart(data) {
 
         const opts = {
           title: "Current / Voltage",
           ...getSize(),
+          plugins: [
+            wheelZoomPlugin({factor: 0.75})
+          ],
           cursor: {
             drag: {
               setScale: false,
@@ -123,17 +255,18 @@
             init: [
               u => {
                 u.root.querySelector(".u-over").ondblclick = e => {
-                  updateOrMakeChart(u);
+                  updateOrMakeChart();
                 }
               }
             ],
           },
         };
 
-        let u = new uPlot(opts, data, document.getElementById("chart"));
+        let plot = new uPlot(opts, data, document.getElementById("chart"));
         
-        window.addEventListener("resize", e => { u.setSize(getSize()); });
-
+        window.addEventListener("resize", e => { plot.setSize(getSize()); });
+        
+        return plot;
       }
     </script>
   </head>

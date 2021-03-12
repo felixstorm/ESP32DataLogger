@@ -13,13 +13,20 @@ bool loggingEnabled;
 #include <INA.h>
 INA_Class INA;
 
+namespace
+{
+    const constexpr char *kLoggingTag = "App";
+}
+
+void collectDataPointsTask(void *pvParameters);
+
 void setup()
 {
     // default first as it will clear all existing entries
     esp_log_level_set("*", ESP_LOG_INFO);
 
     esp_log_level_set("App", ESP_LOG_DEBUG);
-    esp_log_level_set("Logger", ESP_LOG_DEBUG);
+    esp_log_level_set("Logger", ESP_LOG_VERBOSE);
 
     ESP_LOGI("Setup", "*** ESP32 DataLogger starting ***");
 
@@ -29,12 +36,8 @@ void setup()
 
     tft.init();
     tft.setRotation(1);
-    tft.setTextSize(2);
     tft.setTextFont(4);
     tft.fillScreen(TFT_BLACK);
-    tft.setCursor(0, 0);
-    tft.println("C");
-    tft.println("V");
 
     ESP_LOGI("SetupWiFi", "Connecting to %s", ssid);
     if (String(WiFi.SSID()) != String(ssid))
@@ -78,49 +81,70 @@ void setup()
     setupWebServer();
 
     uint8_t devicesFound = INA.begin(1, 100000); // Expected max Amp & shunt resistance
-    ESP_LOGW("App", "Detected %d INA devices on the I2C bus", devicesFound);
+    ESP_LOGW(kLoggingTag, "Detected %d INA devices on the I2C bus", devicesFound);
     if (devicesFound != 1)
         while (true)
             ;
-    ESP_LOGI("App", "INA device address: %d, name: %s", INA.getDeviceAddress(), INA.getDeviceName());
+    ESP_LOGI(kLoggingTag, "INA device address: %d, name: %s", INA.getDeviceAddress(), INA.getDeviceName());
     INA.setBusConversion(8500);            // Maximum conversion time 8.244ms
     INA.setShuntConversion(8500);          // Maximum conversion time 8.244ms
     INA.setAveraging(64);                  // Average each reading n-times
     INA.setMode(INA_MODE_CONTINUOUS_BOTH); // Bus/shunt measured continuously
+
+    xTaskCreate(collectDataPointsTask, "collectDataPoints", 8192 * 2, nullptr, uxTaskPriorityGet(nullptr) + 1, nullptr);
 }
 
 void loop()
 {
-    ulong now = millis();
+    button1.loop();
+    button2.loop();
+    loopWebServer();
+}
 
-    static ulong millisLast = 0;
-    if (now - millisLast >= 1000)
+void collectDataPointsTask(void *pvParameters)
+{
+    ESP_LOGD(kLoggingTag, "Entering collectDataPointsTask()");
+
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextSize(2);
+    int tftWidth = tft.width();
+    int fontHeight = tft.fontHeight();
+
+    tft.setTextDatum(TL_DATUM); // left aligned
+    int alignPosX = tftWidth - max(tft.textWidth(" mA"), tft.textWidth(" V"));
+    tft.drawString(" mA", alignPosX, fontHeight * 0);
+    int cPadding = tft.textWidth("-32000");
+    tft.drawString(" V", alignPosX, fontHeight * 1);
+    int vPadding = tft.textWidth("-20.00");
+
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    int latestRecordsCounter = 0;
+    for (;;)
     {
         Record record;
 
         record.currentMilliAmps = INA.getBusMicroAmps() / 1000;
-        ESP_LOGD("App", "currentMilliAmps: %f", record.currentMilliAmps);
+        ESP_LOGD(kLoggingTag, "currentMilliAmps: %f", record.currentMilliAmps);
         record.voltageMilliVolts = INA.getBusMilliVolts();
-        ESP_LOGD("App", "voltageMilliVolts: %f", record.voltageMilliVolts);
+        ESP_LOGD(kLoggingTag, "voltageMilliVolts: %f", record.voltageMilliVolts);
 
         if (loggingEnabled)
-            addRecord(record);
+            addRecord(record, latestRecordsCounter % 10 == 0);
+        latestRecordsCounter++;
 
         tft.setTextSize(2);
-        tft.setCursor(70, 0);
-        tft.printf("%4.0f mA", record.currentMilliAmps);
-        tft.setCursor(70, 52);
-        tft.printf("%4.2f V", record.voltageMilliVolts / 1000);
+        tft.setTextDatum(TR_DATUM); // right aligned
+        tft.setTextPadding(cPadding);
+        tft.drawFloat(record.currentMilliAmps, 0, alignPosX, fontHeight * 0);
+        tft.setTextPadding(vPadding);
+        tft.drawFloat(record.voltageMilliVolts / 1000, 2, alignPosX, fontHeight * 1);
+        tft.setTextPadding(0);
 
         tft.setTextSize(1);
-        tft.setCursor(0, 104);
-        tft.printf("Log: %s, Queue: %-5d", loggingEnabled ? "on" : "off", getQueueSize());
+        tft.setTextDatum(TL_DATUM); // left aligned
+        tft.setCursor(0, fontHeight * 2);
+        tft.printf("Lg: %d, Qu: %d, Db: %d   ", loggingEnabled, getQueueSize(), dbFileExists(true));
 
-        millisLast = now;
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
     }
-
-    button1.loop();
-    button2.loop();
-
-    loopWebServer();
 }

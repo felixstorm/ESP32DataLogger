@@ -1,10 +1,14 @@
 #include "Main.h"
+#include "DataLogger.hpp"
+#include <CircularBuffer.h>
 
 #include <byteswap.h>
 
 namespace
 {
     const constexpr char *kLoggingTag = "Logger";
+
+    AsyncEventSource events("/dataevents");
 
     const constexpr char *dbFilename = "/spiffs/Esp32DataLogger.db";
     const constexpr int dbPageSizeExp = 12; // 4096
@@ -22,6 +26,9 @@ namespace
     struct dblog_read_context dataReadDbContext;
     time_t dataReadLastTimestamp;
     bool dataReadFinalize;
+
+    SemaphoreHandle_t latestRecordsMutex = xSemaphoreCreateMutex();
+    CircularBuffer<Record, latestRecordsBufferSize> latestRecordsBuffer;
 }
 
 void setupDataLogger(int flushEverySeconds, int queueLength)
@@ -33,7 +40,7 @@ void setupDataLogger(int flushEverySeconds, int queueLength)
     flushEveryMillis = flushEverySeconds * 1000;
     recordQueueHandle = xQueueCreate(queueLength, sizeof(Record));
 
-    auto createTaskResult = xTaskCreate(queueTask, "recordQueue", 8192, nullptr, 5, &queueTaskHandle);
+    auto createTaskResult = xTaskCreate(queueTask, "recordQueue", 8192 * 2, nullptr, uxTaskPriorityGet(nullptr), &queueTaskHandle);
     if (createTaskResult != pdPASS)
     {
         ESP_LOGE(kLoggingTag, "Error %d creating task", createTaskResult);
@@ -41,7 +48,24 @@ void setupDataLogger(int flushEverySeconds, int queueLength)
             ;
     }
 
-    asyncWebServer.on("/data", HTTP_GET, respondWithData);
+    asyncWebServer.serveStatic("/", SPIFFS, "/").setDefaultFile("index.htm");
+    asyncWebServer.on("/data", HTTP_GET, dataResponseHandler);
+
+    events.onConnect([](AsyncEventSourceClient *client) {
+        ESP_LOGI(kLoggingTag, "SSE client connected");
+        if (xSemaphoreTake(latestRecordsMutex, 100) == pdTRUE)
+        {
+            using index_t = decltype(latestRecordsBuffer)::index_t;
+            for (index_t i = 0; i < latestRecordsBuffer.size(); i++)
+            {
+                ESP_LOGI(kLoggingTag, "Sending latestRecordsBuffer[%d]", i);
+                // ESP_LOGI(kLoggingTag, "Sending latestRecordsBuffer[%d]: %s", i, latestRecordsBuffer[i].toJsonString().c_str());
+                events.send(latestRecordsBuffer[i].toJsonString().c_str());
+            }
+            xSemaphoreGive(latestRecordsMutex);
+        }
+    });
+    asyncWebServer.addHandler(&events);
 }
 
 bool isDatabaseAccessible()
@@ -49,9 +73,17 @@ bool isDatabaseAccessible()
     return dbAccessible;
 }
 
-bool addRecord(const Record &record)
+bool addRecord(const Record &record, bool addToRingbuffer)
 {
     ESP_LOGD(kLoggingTag, "Entering addRecord()");
+
+    events.send(record.toJsonString().c_str());
+
+    if (addToRingbuffer && xSemaphoreTake(latestRecordsMutex, 100) == pdTRUE)
+    {
+        latestRecordsBuffer.push(record);
+        xSemaphoreGive(latestRecordsMutex);
+    }
 
     return xQueueSendToBack(recordQueueHandle, &record, 0) == pdPASS;
 }
@@ -214,27 +246,32 @@ exit:
 void resetDb()
 {
     ESP_LOGI(kLoggingTag, "Resetting / removing database");
-
     if (dbFileExists())
     {
         auto removeResult = SPIFFS.remove(dbFilenameWithoutFs);
         ESP_LOGI(kLoggingTag, "Remove result: %d", removeResult);
     }
 
+    ESP_LOGI(kLoggingTag, "Clearing queue");
+    xQueueReset(recordQueueHandle);
+
     dbAccessible = true;
 }
 
-bool dbFileExists()
+bool dbFileExists(bool noLog)
 {
     ESP_LOGD(kLoggingTag, "Entering dbFileExists()");
 
     bool fileExists = SPIFFS.exists(dbFilenameWithoutFs);
-    ESP_LOGI(kLoggingTag, "Database file exists: %d", fileExists);
+    if (!noLog)
+        ESP_LOGI(kLoggingTag, "Database file exists: %d", fileExists);
+    else
+        ESP_LOGD(kLoggingTag, "Database file exists: %d", fileExists);
 
     return fileExists;
 }
 
-void respondWithData(AsyncWebServerRequest *request)
+void dataResponseHandler(AsyncWebServerRequest *request)
 {
     ESP_LOGD(kLoggingTag, "Entering respondWithData()");
 
@@ -250,7 +287,7 @@ void respondWithData(AsyncWebServerRequest *request)
     if (!recordsFrom)
     {
         time(&recordsFrom);
-        recordsFrom -= 60;
+        recordsFrom -= 60 * 60;
     }
     ESP_LOGI(kLoggingTag, "Responding with data: recordsFrom = %ld, recordsUntil = %ld", recordsFrom, recordsUntil);
 
@@ -258,6 +295,14 @@ void respondWithData(AsyncWebServerRequest *request)
     {
         request->send(500);
         return;
+    }
+
+    if (!dbFileExists())
+    {
+        request->send(200, "application/json", "[]");
+        releaseDbMutex("respondWithData empty");
+        sentResponse = true;
+        goto exitHandler;
     }
 
     memset(&dataReadDbContext, 0, sizeof(dataReadDbContext));
@@ -269,13 +314,13 @@ void respondWithData(AsyncWebServerRequest *request)
     if (!dbFile)
     {
         ESP_LOGE(kLoggingTag, "Error opening database file '%s'", dbFilename);
-        goto exit;
+        goto exitHandler;
     }
     res = dblog_read_init(&dataReadDbContext);
     if (res)
     {
         ESP_LOGE(kLoggingTag, "dblog_read_init returned error %d", res);
-        goto exit;
+        goto exitHandler;
     }
     ESP_LOGI(kLoggingTag, "Page size: %d, last data page: %d", (int32_t)1 << dataReadDbContext.page_size_exp, dataReadDbContext.last_leaf_page);
 
@@ -283,48 +328,55 @@ void respondWithData(AsyncWebServerRequest *request)
     if (res)
     {
         ESP_LOGE(kLoggingTag, "dblog_bin_srch_row_by_val returned error %d", res);
-        goto exit;
+        goto exitHandler;
     }
 
     dataReadLastTimestamp = 0;
     dataReadFinalize = false;
-    response = request->beginChunkedResponse("text/plain", [recordsUntil](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+    response = request->beginChunkedResponse("application/json", [recordsUntil](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
         ESP_LOGV(kLoggingTag, "ChunkedResponse: recordsUntil = %ld, dataReadFinalize = %d, dataReadLastTimestamp = %ld, buffer = %p, maxLen = %d, index = %d",
                  recordsUntil, dataReadFinalize, dataReadLastTimestamp, buffer, maxLen, index);
         uint8_t *workBuffer = buffer;
         size_t lengthRemaining = maxLen;
+        size_t bytesWritten;
 
         if (dataReadFinalize)
             return 0;
 
-        *workBuffer = index == 0 ? '[' : ',';
-        workBuffer += 1;
-        lengthRemaining -= 1;
-
-        if (index != 0)
+        bool isFirstRecord = index == 0;
+        while (lengthRemaining > Record::JsonMaxChars)
         {
-            if ((recordsUntil && dataReadLastTimestamp >= recordsUntil) || dblog_read_next_row(&dataReadDbContext))
+            *workBuffer = isFirstRecord ? '[' : ',';
+            workBuffer += 1;
+            lengthRemaining -= 1;
+
+            if (!isFirstRecord)
             {
-                *(workBuffer - 1) = ']';
-                dataReadFinalize = true;
+                if ((recordsUntil && dataReadLastTimestamp >= recordsUntil) || dblog_read_next_row(&dataReadDbContext))
+                {
+                    *(workBuffer - 1) = ']';
+                    dataReadFinalize = true;
+                    goto exitResponse;
+                }
             }
-        }
 
-        if (!dataReadFinalize)
-        {
-            auto rowArray = rowToJsonArrayDocument(&dataReadDbContext);
-            int bytesWritten = serializeJson(rowArray, workBuffer, lengthRemaining);
+            auto rowBuffer = rowToBuffer(&dataReadDbContext, recordsUntil ? &dataReadLastTimestamp : nullptr);
+            rowBuffer.getBytes(workBuffer, lengthRemaining);
+            bytesWritten = rowBuffer.length();
             workBuffer += bytesWritten;
             lengthRemaining -= bytesWritten;
 
-            if (recordsUntil)
-            {
-                uint32_t col_type;
-                dataReadLastTimestamp = read_int32((const byte *)dblog_read_col_val(&dataReadDbContext, 0, &col_type));
-            }
+            isFirstRecord = false;
         }
 
-        int bytesWritten = maxLen - lengthRemaining;
+        // completely fill remaining buffer as otherwise we might get called again with a maxLen of 3 or so instead of with a new large buffer...
+        for (bytesWritten = 0; bytesWritten < lengthRemaining; bytesWritten++)
+            workBuffer[bytesWritten] = ' ';
+        workBuffer += bytesWritten;
+        lengthRemaining -= bytesWritten;
+
+    exitResponse:
+        bytesWritten = maxLen - lengthRemaining;
         ESP_LOGV(kLoggingTag, "ChunkedResponse: bytesWritten = %d, buffer = '%.*s', lengthRemaining = %d, dataReadFinalize = %d, dataReadLastTimestamp = %ld",
                  bytesWritten, bytesWritten, buffer, lengthRemaining, dataReadFinalize, dataReadLastTimestamp);
 
@@ -337,7 +389,7 @@ void respondWithData(AsyncWebServerRequest *request)
     request->send(response);
     sentResponse = true;
 
-exit:
+exitHandler:
     if (!sentResponse)
     {
         request->send(500);
@@ -347,16 +399,22 @@ exit:
     }
 }
 
-DynamicJsonDocument rowToJsonArrayDocument(struct dblog_read_context *ctx)
+String rowToBuffer(struct dblog_read_context *ctx, time_t *timestamp)
 {
-    DynamicJsonDocument jsonDoc(JSON_ARRAY_SIZE(3));
-    JsonArray jsonArray = jsonDoc.to<JsonArray>();
-    for (int i = 0; addColumnToJsonArray(ctx, i, jsonArray); i++)
+    String buffer((char *)nullptr);
+    for (int i = 0; addColumnToBuffer(ctx, i, buffer); i++)
         ;
-    return jsonDoc;
+
+    if (timestamp)
+    {
+        uint32_t col_type;
+        *timestamp = (time_t)read_int32((const byte *)dblog_read_col_val(ctx, 0, &col_type));
+    }
+
+    return buffer;
 }
 
-bool addColumnToJsonArray(struct dblog_read_context *ctx, int col_idx, JsonArray jsonArray)
+bool addColumnToBuffer(struct dblog_read_context *ctx, int col_idx, String &buffer)
 {
     uint32_t col_type;
     const byte *col_val = (const byte *)dblog_read_col_val(ctx, col_idx, &col_type);
@@ -364,30 +422,36 @@ bool addColumnToJsonArray(struct dblog_read_context *ctx, int col_idx, JsonArray
     {
         if (col_idx == 0)
             ESP_LOGE(kLoggingTag, "Error reading column value");
+        else
+            buffer.concat(']');
         return false;
     }
+
+    buffer.concat(col_idx == 0 ? '[' : ',');
 
     switch (col_type)
     {
     case 0:
-        jsonArray.add(nullptr);
+        buffer.concat("null");
         break;
     case 1:
-        jsonArray.add(*((int8_t *)col_val));
+        buffer.concat(*((int8_t *)col_val));
         break;
     case 2:
-        jsonArray.add(read_int16(col_val));
+        buffer.concat(read_int16(col_val));
         break;
     case 4:
-        jsonArray.add(read_int32(col_val));
+        buffer.concat(read_int32(col_val));
         break;
-#if ARDUINOJSON_USE_LONG_LONG
     case 6:
-        jsonArray.add(read_int64(col_val));
-        break;
-#endif
+    {
+        char buf[2 + 3 * sizeof(int64_t)];
+        sprintf(buf, "%lld", read_int64(col_val));
+        buffer.concat(buf);
+    }
+    break;
     case 7:
-        jsonArray.add(read_double(col_val));
+        buffer.concat(read_double(col_val));
         break;
     default:
     {
@@ -398,18 +462,16 @@ bool addColumnToJsonArray(struct dblog_read_context *ctx, int col_idx, JsonArray
         }
 
         uint32_t col_len = dblog_derive_data_len(col_type);
-        String stringValue;
-        stringValue.reserve(col_type % 2 ? col_len : col_len * 2);
+        buffer.reserve(buffer.length() + (col_type % 2 ? col_len : col_len * 2));
         for (int j = 0; j < col_len; j++)
         {
             if (col_type % 2)
-                stringValue += (char)col_val[j];
+                buffer.concat((char)col_val[j]);
             else
             {
-                stringValue += String(col_val[j], HEX);
+                buffer.concat(String(col_val[j], HEX));
             }
         }
-        jsonArray.add(stringValue);
     }
     }
 
