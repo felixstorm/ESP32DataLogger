@@ -55,11 +55,12 @@ void setupDataLogger(int flushEverySeconds, int queueLength)
         ESP_LOGI(kLoggingTag, "SSE client connected");
         if (xSemaphoreTake(latestRecordsMutex, 100) == pdTRUE)
         {
+            // TODO: combine multiple records into one event message as JSON array or do this in a separate (one-off) task
             using index_t = decltype(latestRecordsBuffer)::index_t;
             for (index_t i = 0; i < latestRecordsBuffer.size(); i++)
             {
                 ESP_LOGI(kLoggingTag, "Sending latestRecordsBuffer[%d]", i);
-                // ESP_LOGI(kLoggingTag, "Sending latestRecordsBuffer[%d]: %s", i, latestRecordsBuffer[i].toJsonString().c_str());
+                // only send a few samples here to avoid AsyncTCP locking up
                 events.send(latestRecordsBuffer[i].toJsonString().c_str());
             }
             xSemaphoreGive(latestRecordsMutex);
